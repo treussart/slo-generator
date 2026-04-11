@@ -1,0 +1,40 @@
+# Example `slo:` fragment for charts using `slo-handwritten.prometheusrule.yaml`.
+#
+# Requires the same .Values.global keys as other charts:
+#   global.team, global.environment, global.pop, global.clusterType
+#
+# Copy the PrometheusRule template into the chart's templates/ (e.g. as prometheus-rules-slo.yaml).
+
+slo:
+  enabled: false
+
+  # app.kubernetes.io/part-of (e.g. dns, services ...)
+  partOf: subDomain
+  domain: domain
+
+  # Optional runbook URL for alert annotations (omit key if none)
+  # runbookUrl: https://github.com/treussart/slo-generator/-/blob/main/runbook.md#my-anchor
+
+  alerting:
+    # Multi-window burn-rate alerts (same layout as Sloth); keep false until recordings look healthy
+    enabled: false
+
+  # Prometheus label fragment inside metric selectors (comma after namespace is in the template).
+  # Default when unset: job="<Chart.Name>"
+
+  # Success targets in (0,1] (burn-rate thresholds use error budget = 1 - objective)
+  availabilityObjective: 0.999
+  latencyObjective: 0.80
+
+  # Must match an existing histogram le= on handler_http_response_seconds_bucket
+  latencyHistogramLe: "0.5"
+
+  # Optional: override Sloth-default windows (must include every window referenced in alert rules)
+  # burnRateWindows:
+  #   - 5m
+  #   - 30m
+  #   - 1h
+  #   - 2h
+  #   - 6h
+  #   - 1d
+  #   - 3d

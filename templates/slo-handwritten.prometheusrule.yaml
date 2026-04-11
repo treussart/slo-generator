@@ -1,0 +1,475 @@
+# Hand-written PrometheusRule: Sloth-compatible metric names and labels (no Sloth binary / Go generator).
+#
+# Copy into a chart's templates/ as e.g. prometheus-rules-slo.yaml and merge values from
+# slo-handwritten.values.example.yaml.
+#
+# - Seven short windows: `range` over `.Values.slo.burnRateWindows` (default Sloth set).
+#   Record names: `slo:sli_error:ratio_rate<window>` (e.g. ratio_rate5m).
+# - 30-day rolling average: `slo:sli_error:ratio_rate30d` (uses sum_over_time/count_over_time on the first window's 5m series).
+# - Meta: objective, error budget, burn rates, budget remaining, `sloth_slo_info`.
+# - Multi-window burn-rate alerts (14.4 / 6 / 3 / 1 factors) when `slo.alerting.enabled`.
+#
+# Alert expressions reference windows by index into the default list [5m, 30m, 1h, 2h, 6h, 1d, 3d].
+# If you override `burnRateWindows`, keep the same seven durations in the same order, or adjust the alert blocks accordingly.
+#
+
+{{- $s := .Values.slo | default dict }}
+{{- if $s.enabled }}
+{{- $jobLine := default (printf "job=\"%s\"" .Chart.Name) $s.jobFilter }}
+{{- $availObj := $s.availabilityObjective | default 0.999 | float64 }}
+{{- $latObj := $s.latencyObjective | default 0.80 | float64 }}
+{{- $le := $s.latencyHistogramLe | default "0.5" }}
+{{- $partOf := $s.partOf | default "subDomain" }}
+{{- $domain := $s.domain | default "domain" }}
+{{- $ebAvail := subf 1.0 $availObj }}
+{{- $ebLat := subf 1.0 $latObj }}
+{{- $windows := $s.burnRateWindows | default (list "5m" "30m" "1h" "2h" "6h" "1d" "3d") }}
+{{- $w0 := index $windows 0 }}
+{{- $w1 := index $windows 1 }}
+{{- $w2 := index $windows 2 }}
+{{- $w3 := index $windows 3 }}
+{{- $w4 := index $windows 4 }}
+{{- $w5 := index $windows 5 }}
+{{- $w6 := index $windows 6 }}
+{{- $rb := $s.runbookUrl | default "" }}
+{{- $alerting := ($s.alerting | default dict).enabled | default false }}
+{{- $availPct := printf "%.10g" (mulf $availObj 100) }}
+{{- $latPct := printf "%.10g" (mulf $latObj 100) }}
+
+---
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  annotations:
+    saas.company.com/team: {{ .Values.global.team }}
+    saas.company.com/environment: {{ .Values.global.environment }}
+    saas.company.com/pop: {{ .Values.global.pop }}
+  labels:
+    app.kubernetes.io/component: SLO
+    app.kubernetes.io/managed-by: helm-slo-handwritten
+    app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/name: {{ .Chart.Name }}
+    app.kubernetes.io/part-of: {{ $partOf }}
+    prometheus: infra
+  name: {{ .Chart.Name }}-slo
+spec:
+  groups:
+  - name: sloth-slo-sli-recordings-{{ .Chart.Name }}-requests-availability
+    rules:
+{{- range $w := $windows }}
+    - record: slo:sli_error:ratio_rate{{ $w }}
+      expr: |
+        (
+          (sum(rate(handler_http_response_seconds_count{namespace="{{ $.Release.Namespace }}",{{ $jobLine }},status_code=~"5.."}[{{ $w }}])))
+          or
+          (sum(rate(handler_http_response_seconds_count{namespace="{{ $.Release.Namespace }}",{{ $jobLine }}}[{{ $w }}])) * 0)
+        )
+        /
+        clamp_min((sum(rate(handler_http_response_seconds_count{namespace="{{ $.Release.Namespace }}",{{ $jobLine }}}[{{ $w }}]))), 1e-9)
+      labels:
+        category: availability
+        clusterType: {{ $.Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ $.Values.global.environment }}
+        namespace: {{ $.Release.Namespace }}
+        pop: {{ $.Values.global.pop }}
+        severity: warning
+        sloth_id: {{ $.Chart.Name }}-requests-availability
+        sloth_service: {{ $.Chart.Name }}
+        sloth_slo: requests-availability
+        sloth_window: {{ $w }}
+{{- end }}
+    - record: slo:sli_error:ratio_rate30d
+      expr: |
+        sum_over_time(slo:sli_error:ratio_rate{{ $w0 }}{sloth_id="{{ .Chart.Name }}-requests-availability", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"}[30d])
+        / ignoring (sloth_window)
+        count_over_time(slo:sli_error:ratio_rate{{ $w0 }}{sloth_id="{{ .Chart.Name }}-requests-availability", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"}[30d])
+      labels:
+        category: availability
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-availability
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-availability
+        sloth_window: 30d
+  - name: sloth-slo-meta-recordings-{{ .Chart.Name }}-requests-availability
+    rules:
+    - record: slo:objective:ratio
+      expr: vector({{ $availObj }})
+      labels:
+        category: availability
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-availability
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-availability
+    - record: slo:error_budget:ratio
+      expr: vector({{ $ebAvail }})
+      labels:
+        category: availability
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-availability
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-availability
+    - record: slo:time_period:days
+      expr: vector(30)
+      labels:
+        category: availability
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-availability
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-availability
+    - record: slo:current_burn_rate:ratio
+      expr: |
+        slo:sli_error:ratio_rate{{ $w0 }}{sloth_id="{{ .Chart.Name }}-requests-availability", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"}
+        / on(sloth_id, sloth_slo, sloth_service) group_left
+        slo:error_budget:ratio{sloth_id="{{ .Chart.Name }}-requests-availability", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"}
+      labels:
+        category: availability
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-availability
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-availability
+    - record: slo:period_burn_rate:ratio
+      expr: |
+        slo:sli_error:ratio_rate30d{sloth_id="{{ .Chart.Name }}-requests-availability", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"}
+        / on(sloth_id, sloth_slo, sloth_service) group_left
+        slo:error_budget:ratio{sloth_id="{{ .Chart.Name }}-requests-availability", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"}
+      labels:
+        category: availability
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-availability
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-availability
+    - record: slo:period_error_budget_remaining:ratio
+      expr: 1 - slo:period_burn_rate:ratio{sloth_id="{{ .Chart.Name }}-requests-availability",
+        sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"}
+      labels:
+        category: availability
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-availability
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-availability
+    - record: sloth_slo_info
+      expr: vector(1)
+      labels:
+        category: availability
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-availability
+        sloth_mode: api-gen-prom
+        sloth_objective: "{{ $availPct }}"
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-availability
+        sloth_spec: prometheus/v1
+        sloth_version: v0.16.0
+{{- if $alerting }}
+  - name: sloth-slo-alerts-{{ .Chart.Name }}-requests-availability
+    rules:
+    - alert: {{ .Chart.Name }}-HighErrorRateAvailability
+      annotations:
+        contact: {{ .Values.global.team }}
+        {{- if $rb }}
+        runbook_url: {{ $rb }}
+        {{- end }}
+        summary: High error rate (5xx) on '{{ .Chart.Name }}' requests
+        title: (page) {{`{{ $labels.sloth_service }}`}} {{`{{ $labels.sloth_slo }}`}} SLO error budget burn rate is too fast.
+      expr: |
+        (
+            max(slo:sli_error:ratio_rate{{ $w0 }}{sloth_id="{{ .Chart.Name }}-requests-availability", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"} > (14.4 * {{ $ebAvail }})) without (sloth_window)
+            and
+            max(slo:sli_error:ratio_rate{{ $w2 }}{sloth_id="{{ .Chart.Name }}-requests-availability", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"} > (14.4 * {{ $ebAvail }})) without (sloth_window)
+        )
+        or
+        (
+            max(slo:sli_error:ratio_rate{{ $w1 }}{sloth_id="{{ .Chart.Name }}-requests-availability", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"} > (6 * {{ $ebAvail }})) without (sloth_window)
+            and
+            max(slo:sli_error:ratio_rate{{ $w4 }}{sloth_id="{{ .Chart.Name }}-requests-availability", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"} > (6 * {{ $ebAvail }})) without (sloth_window)
+        )
+      labels:
+        category: availability
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_severity: page
+    - alert: {{ .Chart.Name }}-HighErrorRateAvailability
+      annotations:
+        contact: {{ .Values.global.team }}
+        {{- if $rb }}
+        runbook_url: {{ $rb }}
+        {{- end }}
+        summary: High error rate (5xx) on '{{ .Chart.Name }}' requests
+        title: (ticket) {{`{{ $labels.sloth_service }}`}} {{`{{ $labels.sloth_slo }}`}} SLO error budget burn rate is too fast.
+      expr: |
+        (
+            max(slo:sli_error:ratio_rate{{ $w3 }}{sloth_id="{{ .Chart.Name }}-requests-availability", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"} > (3 * {{ $ebAvail }})) without (sloth_window)
+            and
+            max(slo:sli_error:ratio_rate{{ $w5 }}{sloth_id="{{ .Chart.Name }}-requests-availability", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"} > (3 * {{ $ebAvail }})) without (sloth_window)
+        )
+        or
+        (
+            max(slo:sli_error:ratio_rate{{ $w4 }}{sloth_id="{{ .Chart.Name }}-requests-availability", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"} > (1 * {{ $ebAvail }})) without (sloth_window)
+            and
+            max(slo:sli_error:ratio_rate{{ $w6 }}{sloth_id="{{ .Chart.Name }}-requests-availability", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-availability"} > (1 * {{ $ebAvail }})) without (sloth_window)
+        )
+      labels:
+        category: availability
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_severity: ticket
+{{- end }}
+
+  - name: sloth-slo-sli-recordings-{{ .Chart.Name }}-requests-latency
+    rules:
+{{- range $w := $windows }}
+    - record: slo:sli_error:ratio_rate{{ $w }}
+      expr: |
+        ((
+          sum(rate(handler_http_response_seconds_count{namespace="{{ $.Release.Namespace }}",{{ $jobLine }},status_code=~"2.."}[{{ $w }}]))
+          -
+          sum(rate(handler_http_response_seconds_bucket{namespace="{{ $.Release.Namespace }}",{{ $jobLine }},status_code=~"2..",le="{{ $le }}"}[{{ $w }}]))
+        )
+        )
+        /
+        clamp_min((sum(rate(handler_http_response_seconds_count{namespace="{{ $.Release.Namespace }}",{{ $jobLine }},status_code=~"2.."}[{{ $w }}]))), 1e-9)
+      labels:
+        category: latency
+        clusterType: {{ $.Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ $.Values.global.environment }}
+        namespace: {{ $.Release.Namespace }}
+        pop: {{ $.Values.global.pop }}
+        severity: warning
+        sloth_id: {{ $.Chart.Name }}-requests-latency
+        sloth_service: {{ $.Chart.Name }}
+        sloth_slo: requests-latency
+        sloth_window: {{ $w }}
+{{- end }}
+    - record: slo:sli_error:ratio_rate30d
+      expr: |
+        sum_over_time(slo:sli_error:ratio_rate{{ $w0 }}{sloth_id="{{ .Chart.Name }}-requests-latency", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"}[30d])
+        / ignoring (sloth_window)
+        count_over_time(slo:sli_error:ratio_rate{{ $w0 }}{sloth_id="{{ .Chart.Name }}-requests-latency", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"}[30d])
+      labels:
+        category: latency
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-latency
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-latency
+        sloth_window: 30d
+  - name: sloth-slo-meta-recordings-{{ .Chart.Name }}-requests-latency
+    rules:
+    - record: slo:objective:ratio
+      expr: vector({{ $latObj }})
+      labels:
+        category: latency
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-latency
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-latency
+    - record: slo:error_budget:ratio
+      expr: vector({{ $ebLat }})
+      labels:
+        category: latency
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-latency
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-latency
+    - record: slo:time_period:days
+      expr: vector(30)
+      labels:
+        category: latency
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-latency
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-latency
+    - record: slo:current_burn_rate:ratio
+      expr: |
+        slo:sli_error:ratio_rate{{ $w0 }}{sloth_id="{{ .Chart.Name }}-requests-latency", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"}
+        / on(sloth_id, sloth_slo, sloth_service) group_left
+        slo:error_budget:ratio{sloth_id="{{ .Chart.Name }}-requests-latency", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"}
+      labels:
+        category: latency
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-latency
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-latency
+    - record: slo:period_burn_rate:ratio
+      expr: |
+        slo:sli_error:ratio_rate30d{sloth_id="{{ .Chart.Name }}-requests-latency", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"}
+        / on(sloth_id, sloth_slo, sloth_service) group_left
+        slo:error_budget:ratio{sloth_id="{{ .Chart.Name }}-requests-latency", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"}
+      labels:
+        category: latency
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-latency
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-latency
+    - record: slo:period_error_budget_remaining:ratio
+      expr: 1 - slo:period_burn_rate:ratio{sloth_id="{{ .Chart.Name }}-requests-latency",
+        sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"}
+      labels:
+        category: latency
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-latency
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-latency
+    - record: sloth_slo_info
+      expr: vector(1)
+      labels:
+        category: latency
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_id: {{ .Chart.Name }}-requests-latency
+        sloth_mode: api-gen-prom
+        sloth_objective: "{{ $latPct }}"
+        sloth_service: {{ .Chart.Name }}
+        sloth_slo: requests-latency
+        sloth_spec: prometheus/v1
+        sloth_version: v0.16.0
+{{- if $alerting }}
+  - name: sloth-slo-alerts-{{ .Chart.Name }}-requests-latency
+    rules:
+    - alert: {{ .Chart.Name }}-HighErrorRateLatency
+      annotations:
+        contact: {{ .Values.global.team }}
+        {{- if $rb }}
+        runbook_url: {{ $rb }}
+        {{- end }}
+        summary: High latency error rate on '{{ .Chart.Name }}' requests
+        title: (page) {{`{{ $labels.sloth_service }}`}} {{`{{ $labels.sloth_slo }}`}} SLO error budget burn rate is too fast.
+      expr: |
+        (
+            max(slo:sli_error:ratio_rate{{ $w0 }}{sloth_id="{{ .Chart.Name }}-requests-latency", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"} > (14.4 * {{ $ebLat }})) without (sloth_window)
+            and
+            max(slo:sli_error:ratio_rate{{ $w2 }}{sloth_id="{{ .Chart.Name }}-requests-latency", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"} > (14.4 * {{ $ebLat }})) without (sloth_window)
+        )
+        or
+        (
+            max(slo:sli_error:ratio_rate{{ $w1 }}{sloth_id="{{ .Chart.Name }}-requests-latency", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"} > (6 * {{ $ebLat }})) without (sloth_window)
+            and
+            max(slo:sli_error:ratio_rate{{ $w4 }}{sloth_id="{{ .Chart.Name }}-requests-latency", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"} > (6 * {{ $ebLat }})) without (sloth_window)
+        )
+      labels:
+        category: latency
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_severity: page
+    - alert: {{ .Chart.Name }}-HighErrorRateLatency
+      annotations:
+        contact: {{ .Values.global.team }}
+        {{- if $rb }}
+        runbook_url: {{ $rb }}
+        {{- end }}
+        summary: High latency error rate on '{{ .Chart.Name }}' requests
+        title: (ticket) {{`{{ $labels.sloth_service }}`}} {{`{{ $labels.sloth_slo }}`}} SLO error budget burn rate is too fast.
+      expr: |
+        (
+            max(slo:sli_error:ratio_rate{{ $w3 }}{sloth_id="{{ .Chart.Name }}-requests-latency", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"} > (3 * {{ $ebLat }})) without (sloth_window)
+            and
+            max(slo:sli_error:ratio_rate{{ $w5 }}{sloth_id="{{ .Chart.Name }}-requests-latency", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"} > (3 * {{ $ebLat }})) without (sloth_window)
+        )
+        or
+        (
+            max(slo:sli_error:ratio_rate{{ $w4 }}{sloth_id="{{ .Chart.Name }}-requests-latency", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"} > (1 * {{ $ebLat }})) without (sloth_window)
+            and
+            max(slo:sli_error:ratio_rate{{ $w6 }}{sloth_id="{{ .Chart.Name }}-requests-latency", sloth_service="{{ .Chart.Name }}", sloth_slo="requests-latency"} > (1 * {{ $ebLat }})) without (sloth_window)
+        )
+      labels:
+        category: latency
+        clusterType: {{ .Values.global.clusterType }}
+        domain: {{ $domain }}
+        environment: {{ .Values.global.environment }}
+        namespace: {{ .Release.Namespace }}
+        pop: {{ .Values.global.pop }}
+        severity: warning
+        sloth_severity: ticket
+{{- end }}
+{{- end }}
